@@ -3,31 +3,24 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { ExchangeService } from '../exchange/exchange.service';
 import { TrendRsiStrategy } from '../strategy/trend-rsi.strategy';
+import { RiskManagementService } from 'src/risk-management/risk-management.service';
+import { VolatilityAdjusterService } from 'src/risk-management/services/volatility-adjuster.service';
 
 @Injectable()
 export class TradingService {
   private readonly logger = new Logger(TradingService.name);
   private symbol: string;
-  private positionSize: string;
-  private stopLossPercent: number;
-  private takeProfitPercent: number;
-  private maxOpenPositions: number;
   private isTrading: boolean = true;
 
   constructor(
     private configService: ConfigService,
     private exchangeService: ExchangeService,
     private trendRsiStrategy: TrendRsiStrategy,
+    private riskManagementService: RiskManagementService,
+    private volatilityAdjuster: VolatilityAdjusterService,
   ) {
     this.symbol = this.configService.get<string>('SYMBOL') || 'BTCUSDT';
-    this.positionSize = this.configService.get<string>('POSITION_SIZE') || '0.01';
-    this.stopLossPercent = parseFloat(this.configService.get<string>('STOP_LOSS_PERCENT') || '1');
-    this.takeProfitPercent = parseFloat(this.configService.get<string>('TAKE_PROFIT_PERCENT') || '2');
-    this.maxOpenPositions = parseInt(this.configService.get<string>('MAX_OPEN_POSITIONS') || '1');
-    
-    this.logger.log(`Торговый сервис инициализирован для ${this.symbol}`);
-    this.logger.log(`Размер позиции: ${this.positionSize} BTC`);
-    this.logger.log(`Стоп-лосс: ${this.stopLossPercent}%, Тейк-профит: ${this.takeProfitPercent}%`);
+    this.logger.log(`Торговый сервис с риск-менеджментом инициализирован для ${this.symbol}`);
   }
 
   @Cron(CronExpression.EVERY_MINUTE)
@@ -38,148 +31,244 @@ export class TradingService {
     }
     
     try {
-      const positions = await this.exchangeService.getPositions();
-      const openPositionsCount = positions.filter(pos => parseFloat(pos.size) > 0).length;
-      
+      // Получаем сигнал от стратегии
       const signal = await this.trendRsiStrategy.analyze();
-      this.logger.log(`Получен сигнал: ${signal.action} - ${signal.reason}`);
       
-      if (openPositionsCount >= this.maxOpenPositions && (signal.action === 'BUY' || signal.action === 'SELL')) {
-        this.logger.warn(`Достигнуто максимальное количество открытых позиций (${openPositionsCount}/${this.maxOpenPositions})`);
+      if (signal.action === 'HOLD') {
+        this.logger.debug(`Сигнал: ${signal.action} - ${signal.reason}`);
         return;
       }
-      
-      if (signal.action === 'BUY') {
-        await this.openLongPosition(signal.price?.toString() || '');
-      } else if (signal.action === 'SELL') {
-        await this.openShortPosition(signal.price?.toString() || '');
+
+      // Рассчитываем волатильность рынка
+      const klines = await this.exchangeService.getKlines('15m', 50);
+      const closes = klines.map(candle => parseFloat(candle[4])).reverse();
+      const marketVolatility = this.volatilityAdjuster.calculateVolatility(closes);
+
+      // Проводим риск-анализ ПЕРЕД входом в позицию
+      const riskDecision = await this.riskManagementService.evaluateTradeRisk(
+        signal.price || parseFloat(klines[0][4]),
+        signal.action,
+        marketVolatility
+      );
+
+      this.logger.log(
+        `Сигнал: ${signal.action} | Риск: ${riskDecision.riskLevel} | ` +
+        `Можно торговать: ${riskDecision.canTrade} | ${riskDecision.reason}`
+      );
+
+      // Если риски не позволяют торговать
+      if (!riskDecision.canTrade) {
+        this.logger.warn(`❌ Сделка отклонена: ${riskDecision.reason}`);
+        
+        // Логируем действия для анализа
+        riskDecision.actions.forEach(action => this.logger.warn(`   ${action}`));
+        return;
       }
-      
-      await this.updatePositionProtection();
+
+      // Выполняем сделку с параметрами от риск-менеджмента
+      if (signal.action === 'BUY') {
+        await this.openManagedPosition('Buy', riskDecision);
+      } else if (signal.action === 'SELL') {
+        await this.openManagedPosition('Sell', riskDecision);
+      }
+
     } catch (error) {
       this.logger.error(`Ошибка в торговой логике: ${error.message}`);
     }
   }
 
-  private async openLongPosition(price: string) {
+  /**
+   * Открывает позицию с управлением рисками
+   */
+  private async openManagedPosition(
+    side: 'Buy' | 'Sell',
+    riskDecision: any
+  ) {
     try {
-      this.logger.log(`Открываем длинную позицию по ${this.symbol} с размером ${this.positionSize}`);
+      const entryPrice = side === 'Buy' ? 'market' : 'market'; // Можно добавить лимитные ордера
       
-      const order = await this.exchangeService.placeOrder('Buy', this.positionSize);
+      // Рассчитываем размер позиции в базовой валюте (например, BTC для BTCUSDT)
+      const currentPrice = parseFloat((await this.exchangeService.getKlines('1m', 1))[0][4]);
+      const positionSizeInQuote = riskDecision.recommendedPositionSize;
+      const positionSizeInBase = (positionSizeInQuote / currentPrice).toFixed(6);
+
+      this.logger.log(
+        `🎯 Открываем ${side} позицию | ` +
+        `Размер: ${positionSizeInBase} | ` +
+        `Стоимость: $${positionSizeInQuote.toFixed(2)} | ` +
+        `SL: ${riskDecision.adjustedStopLoss.toFixed(2)} | ` +
+        `TP: ${riskDecision.adjustedTakeProfit.toFixed(2)}`
+      );
+
+      // Размещаем основной ордер
+      const order = await this.exchangeService.placeOrder(side, positionSizeInBase);
       
-      if (order) {
-        this.logger.log(`Длинная позиция открыта: ${JSON.stringify(order)}`);
-        
-        if (price) {
-          const priceNum = parseFloat(price);
-          const stopLossPrice = (priceNum * (1 - this.stopLossPercent / 100)).toFixed(2);
-          const takeProfitPrice = (priceNum * (1 + this.takeProfitPercent / 100)).toFixed(2);
-          
-          const positions = await this.exchangeService.getPositions();
-          const position = positions.find(pos => pos.side === 'Buy' && parseFloat(pos.size) > 0);
-          if (position) {
-            await this.exchangeService.setTradingStop(position.positionIdx, stopLossPrice, takeProfitPrice);
-            this.logger.log(`Установлен стоп-лосс: ${stopLossPrice}, тейк-профит: ${takeProfitPrice}`);
-          }
-        }
+      if (!order) {
+        this.logger.error('Не удалось разместить основной ордер');
+        return;
       }
+
+      this.logger.log(`✅ Позиция открыта: ${JSON.stringify(order)}`);
+
+      // Ждем немного и устанавливаем стоп-лосс и тейк-профит
+      setTimeout(async () => {
+        await this.setManagedStops(side, riskDecision);
+      }, 2000);
+
     } catch (error) {
-      this.logger.error(`Ошибка при открытии длинной позиции: ${error.message}`);
+      this.logger.error(`Ошибка при открытии управляемой позиции: ${error.message}`);
     }
   }
 
-  private async openShortPosition(price: string) {
-    try {
-      this.logger.log(`Открываем короткую позицию по ${this.symbol} с размером ${this.positionSize}`);
-      
-      const order = await this.exchangeService.placeOrder('Sell', this.positionSize);
-      
-      if (order) {
-        this.logger.log(`Короткая позиция открыта: ${JSON.stringify(order)}`);
-        
-        if (price) {
-          const priceNum = parseFloat(price);
-          const stopLossPrice = (priceNum * (1 + this.stopLossPercent / 100)).toFixed(2);
-          const takeProfitPrice = (priceNum * (1 - this.takeProfitPercent / 100)).toFixed(2);
-          
-          const positions = await this.exchangeService.getPositions();
-          const position = positions.find(pos => pos.side === 'Sell' && parseFloat(pos.size) > 0);
-          if (position) {
-            await this.exchangeService.setTradingStop(position.positionIdx, stopLossPrice, takeProfitPrice);
-            this.logger.log(`Установлен стоп-лосс: ${stopLossPrice}, тейк-профит: ${takeProfitPrice}`);
-          }
-        }
-      }
-    } catch (error) {
-      this.logger.error(`Ошибка при открытии короткой позиции: ${error.message}`);
-    }
-  }
-
-  private async updatePositionProtection() {
+  /**
+   * Устанавливает стоп-лосс и тейк-профит на основе риск-анализа
+   */
+  private async setManagedStops(side: 'Buy' | 'Sell', riskDecision: any) {
     try {
       const positions = await this.exchangeService.getPositions();
-      
-      for (const position of positions) {
-        if (parseFloat(position.size) === 0) continue;
-        
-        const tradeSide = position.side as 'Buy' | 'Sell';
-        
-        const entryPrice = parseFloat(position.avgPrice || position.avgPrice || position.markPrice || '0');
-        
-        if (!entryPrice) {
-          this.logger.warn(`Не удалось получить цену входа для позиции, пропускаем`);
-          continue;
-        }
-        
-        const hasStopLoss = position.stopLoss && parseFloat(position.stopLoss) > 0;
-        const hasTakeProfit = position.takeProfit && parseFloat(position.takeProfit) > 0;
-        
-        if (!hasStopLoss || !hasTakeProfit) {
-          const stopLossPrice = tradeSide === 'Buy'
-            ? (entryPrice * (1 - this.stopLossPercent / 100)).toFixed(2)
-            : (entryPrice * (1 + this.stopLossPercent / 100)).toFixed(2);
-          const takeProfitPrice = tradeSide === 'Buy'
-            ? (entryPrice * (1 + this.takeProfitPercent / 100)).toFixed(2)
-            : (entryPrice * (1 - this.takeProfitPercent / 100)).toFixed(2);
-          
-          await this.exchangeService.setTradingStop(position.positionIdx, stopLossPrice, takeProfitPrice);
-          this.logger.log(`Обновлены стоп-лосс: ${stopLossPrice}, тейк-профит: ${takeProfitPrice}`);
-        }
+      const position = positions.find(pos => 
+        pos.side === side && parseFloat(pos.size) > 0
+      );
+
+      if (!position) {
+        this.logger.warn('Позиция не найдена для установки стопов');
+        return;
       }
+
+      const success = await this.exchangeService.setTradingStop(
+        position.positionIdx,
+        riskDecision.adjustedStopLoss.toFixed(2),
+        riskDecision.adjustedTakeProfit.toFixed(2)
+      );
+
+      if (success) {
+        this.logger.log(
+          `🛡️ Защита установлена | ` +
+          `SL: ${riskDecision.adjustedStopLoss.toFixed(2)} | ` +
+          `TP: ${riskDecision.adjustedTakeProfit.toFixed(2)}`
+        );
+      } else {
+        this.logger.error('Не удалось установить стоп-лосс и тейк-профит');
+      }
+
     } catch (error) {
-      this.logger.error(`Ошибка при обновлении защиты позиций: ${error.message}`);
+      this.logger.error(`Ошибка при установке управляемых стопов: ${error.message}`);
+    }
+  }
+
+  /**
+   * Мониторинг позиций и обновление стопов
+   */
+  @Cron('*/5 * * * *') // Каждые 5 минут
+  async monitorPositions() {
+    try {
+      const positions = await this.exchangeService.getPositions();
+      const activePositions = positions.filter(pos => parseFloat(pos.size) > 0);
+
+      if (activePositions.length === 0) return;
+
+      // Получаем текущие риск-метрики
+      const riskMetrics = await this.riskManagementService.getCurrentRiskMetrics();
+      
+      if (!riskMetrics) return;
+
+      // Логируем текущее состояние рисков
+      this.logger.debug(
+        `📊 Риск-мониторинг | ` +
+        `Просадка: ${riskMetrics.currentDrawdown.toFixed(2)}% | ` +
+        `Дневной P&L: ${riskMetrics.dailyPnL.toFixed(2)}% | ` +
+        `Риск-скор: ${riskMetrics.riskScore.toFixed(1)}/100`
+      );
+
+      // Если риск-скор высокий, можем ужесточить стопы
+      if (riskMetrics.riskScore > 60) {
+        await this.tightenStopLosses(activePositions, riskMetrics.riskScore);
+      }
+
+    } catch (error) {
+      this.logger.error(`Ошибка при мониторинге позиций: ${error.message}`);
+    }
+  }
+
+  /**
+   * Ужесточает стоп-лоссы при высоком риске
+   */
+  private async tightenStopLosses(positions: any[], riskScore: number) {
+    for (const position of positions) {
+      try {
+        const currentPrice = parseFloat((await this.exchangeService.getKlines('1m', 1))[0][4]);
+        const entryPrice = parseFloat(position.avgPrice);
+        
+        // Рассчитываем текущую прибыль позиции
+        const side = position.side as 'Buy' | 'Sell';
+        const unrealizedPnL = side === 'Buy' 
+          ? (currentPrice - entryPrice) / entryPrice
+          : (entryPrice - currentPrice) / entryPrice;
+
+        // Если позиция в прибыли и риск высокий, подтягиваем стоп к безубытку
+        if (unrealizedPnL > 0.005 && riskScore > 70) { // 0.5% прибыль
+          const breakEvenPrice = side === 'Buy' 
+            ? entryPrice * 1.001 // Небольшой отступ для покрытия комиссий
+            : entryPrice * 0.999;
+
+          await this.exchangeService.setTradingStop(
+            position.positionIdx,
+            breakEvenPrice.toFixed(2),
+            position.takeProfit || '0'
+          );
+
+          this.logger.log(
+            `🔒 Стоп подтянут к безубытку | ` +
+            `${side} | Цена: ${breakEvenPrice.toFixed(2)} | ` +
+            `Риск-скор: ${riskScore.toFixed(1)}`
+          );
+        }
+
+      } catch (error) {
+        this.logger.error(`Ошибка при ужесточении стопов: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Экстренное закрытие всех позиций
+   */
+  async emergencyCloseAll(): Promise<void> {
+    try {
+      this.logger.warn('🚨 ЭКСТРЕННОЕ ЗАКРЫТИЕ ВСЕХ ПОЗИЦИЙ');
+      
+      const positions = await this.exchangeService.getPositions();
+      const activePositions = positions.filter(pos => parseFloat(pos.size) > 0);
+      
+      for (const position of activePositions) {
+        await this.exchangeService.closePosition(
+          String(position.positionIdx),
+          position.side as 'Buy' | 'Sell',
+          position.size
+        );
+        
+        this.logger.warn(`❌ Закрыта ${position.side} позиция размером ${position.size}`);
+      }
+      
+      // Останавливаем торговлю
+      this.stopTrading();
+      
+    } catch (error) {
+      this.logger.error(`Критическая ошибка при экстренном закрытии: ${error.message}`);
     }
   }
 
   stopTrading() {
     this.isTrading = false;
-    this.logger.log('Торговля остановлена');
+    this.logger.log('❌ Торговля остановлена');
   }
 
   startTrading() {
     this.isTrading = true;
-    this.logger.log('Торговля запущена');
+    this.logger.log('✅ Торговля запущена');
   }
 
   async closeAllPositions() {
-    try {
-      const positions = await this.exchangeService.getPositions();
-      
-      for (const position of positions) {
-        if (parseFloat(position.size) > 0) {
-          // Конвертируем positionIdx в строку для метода closePosition
-          await this.exchangeService.closePosition(
-            String(position.positionIdx), 
-            position.side as 'Buy' | 'Sell', 
-            position.size
-          );
-          this.logger.log(`Позиция ${position.side} по ${this.symbol} закрыта`);
-        }
-      }
-      
-      this.logger.log('Все позиции закрыты');
-    } catch (error) {
-      this.logger.error(`Ошибка при закрытии всех позиций: ${error.message}`);
-    }
+    return this.emergencyCloseAll();
   }
 }

@@ -5,6 +5,7 @@ import { ExchangeModule } from './exchange/exchange.module';
 import { StrategyModule } from './strategy/strategy.module';
 import { TradingModule } from './trading/trading.module';
 import { BacktestModule } from './backtest/backtest.module';
+import { RiskManagementModule } from './risk-management/risk-management.module';
 @Module({
   imports: [
     ConfigModule.forRoot({
@@ -14,7 +15,8 @@ import { BacktestModule } from './backtest/backtest.module';
     ExchangeModule,
     StrategyModule,
     TradingModule,
-    BacktestModule
+    BacktestModule,
+    RiskManagementModule
   ],
 })
 export class AppModule {}
